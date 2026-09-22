@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>电源管理</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%231b3a3e'/%3E%3Cstop offset='1' stop-color='%230c1f23'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)' stroke='%2335c3d6' stroke-width='1.5'/%3E%3Crect x='10' y='19' width='38' height='26' rx='6' fill='none' stroke='%2335c3d6' stroke-width='5'/%3E%3Crect x='50.5' y='26' width='5' height='12' rx='2' fill='%2335c3d6'/%3E%3Cpath d='M28 23L18 33.5h6L22.5 41.5 34.5 29.5h-6L32 23z' fill='%23d9f6fa'/%3E%3C/svg%3E">
+<script>
+  // 主题预置：在 <head> 里执行，避免首屏闪白；深色为默认
+  (function(){
+    try {
+      var t = localStorage.getItem('ups_theme');
+      if (t === 'light') document.documentElement.className = 'light';
+    } catch(e){}
+  })();
+</script>
+<style>
+  :root{
+    --bg:#000000; --panel:#0d0d0d; --panel2:#181818; --line:#000000;
+    --txt:#f3ece1; --dim:#9c9c9c; --accent:#35c3d6;
+    --warn:#f0a020; --ok:#4cc38a; --bad:#e5484d; --info:#4a9ad8;
+  }
+  html.light{
+    --bg:#fff; --panel:#fff; --panel2:#f3f3f3; --line:#dcdcdc;
+    --txt:#111; --dim:#555; --accent:#0b8fa5; --warn:#b96e00;
+  }
+  *{box-sizing:border-box}
+  /* 主内容区：限宽居中，窄屏按比例收缩 */
+  #app{max-width:min(1000px, 90%); margin:0 auto}
+  body{
+    background:var(--bg); color:var(--txt);
+    font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;
+    padding:24px; margin:0; zoom:1.5;
+  }
+  @media (max-width:700px){ body{zoom:1; padding:12px} }
+
+  /* 页头 */
+  .hd{display:flex; align-items:center; gap:12px; margin-bottom:18px}
+  .hd .logo{
+    width:34px; height:34px; flex:none; border-radius:8px;
+    background:linear-gradient(135deg,#1b3a3e,#0c1f23);
+    display:flex; align-items:center; justify-content:center;
+    box-shadow:0 2px 10px rgba(0,0,0,.5);
+  }
+  html.light .hd .logo{background:linear-gradient(135deg,#0b8fa5,#35c3d6); box-shadow:0 1px 4px rgba(0,0,0,.15)}
+  .hd h1{font-size:20px; font-weight:700; margin:0; flex:1}
+  .hd .badge{font-size:11px; padding:2px 10px; border-radius:10px; background:var(--panel2); border:1px solid var(--line); white-space:nowrap}
+  .hd .badge.ok{color:var(--ok); border-color:var(--ok)}
+  .hd .badge.warn{color:var(--warn); border-color:var(--warn)}
+  .hd .badge.bad{color:var(--bad); border-color:var(--bad)}
+  .hd .theme{
+    width:32px; height:32px; flex:none; cursor:pointer;
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    display:flex; align-items:center; justify-content:center; color:var(--dim);
+  }
+  .hd .theme:hover{color:var(--accent); border-color:var(--accent)}
+
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:18px 22px; margin-bottom:16px;
+    box-shadow:0 2px 14px rgba(0,0,0,.45);
+  }
+  html.light .card{box-shadow:0 1px 6px rgba(0,0,0,.06)}
+  .sub{color:var(--dim); font-size:12.5px}
+  .badge{font-size:11px; padding:2px 10px; border-radius:10px; background:var(--panel2); border:1px solid var(--line); white-space:nowrap}
+  .badge.ok{color:var(--ok); border-color:var(--ok)}
+  .badge.warn{color:var(--warn); border-color:var(--warn)}
+  .badge.bad{color:var(--bad); border-color:var(--bad)}
+  button{background:var(--accent); color:#fff; border:0; border-radius:8px; padding:8px 18px; font-weight:600; cursor:pointer; font-size:13.5px}
+  button.ghost{background:var(--panel); color:var(--txt); border:1px solid var(--line)}
+  button.ghost:hover{border-color:var(--accent); color:var(--accent)}
+  input,select{background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:6px 9px; font:inherit}
+  input:focus,select:focus{outline:none; border-color:var(--accent)}
+  label.f{display:flex; flex-direction:column; gap:4px; font-size:12.5px; min-width:150px}
+  label.f b{font-weight:400; font-size:12.5px}
+
+  /* 开关 */
+  .switch{position:relative; width:46px; height:26px; flex:none}
+  .switch input{opacity:0; width:0; height:0}
+  .switch .sl{position:absolute; inset:0; background:var(--panel2); border:1px solid var(--line); border-radius:14px; transition:.2s; cursor:pointer}
+  .switch .sl::before{content:''; position:absolute; width:20px; height:20px; border-radius:50%; background:var(--dim); top:2px; left:2px; transition:.2s; box-shadow:0 1px 3px rgba(0,0,0,.4)}
+  .switch input:checked + .sl{background:var(--accent); border-color:var(--accent)}
+  .switch input:checked + .sl::before{transform:translateX(20px); background:#fff}
+
+  /* UPS 状态区 */
+  .ups-wrap{display:flex; gap:34px; align-items:center; flex-wrap:wrap; margin-top:16px}
+  .batt-col{width:120px; text-align:center; flex:none}
+  .battery{width:50px; height:78px; border:3px solid var(--ok); border-radius:10px; position:relative; margin:12px auto 0}
+  .battery::before{content:''; position:absolute; top:-9px; left:50%; transform:translateX(-50%); width:20px; height:7px; background:var(--ok); border-radius:3px}
+  .battery.warn{border-color:var(--warn)} .battery.warn::before{background:var(--warn)}
+  .battery.bad{border-color:var(--bad)} .battery.bad::before{background:var(--bad)}
+  .battery.off{border-color:var(--dim)} .battery.off::before{background:var(--dim)}
+  .batt-fill{position:absolute; bottom:4px; left:4px; right:4px; background:var(--ok); border-radius:5px; transition:height .5s}
+  .batt-fill.warn{background:var(--warn)} .batt-fill.bad{background:var(--bad)} .batt-fill.off{background:var(--dim)}
+  .batt-pct{font-size:15px; font-weight:600; margin-top:6px}
+  .batt-conn{font-size:12.5px; color:var(--dim)}
+  .batt-conn.on{color:var(--ok)} .batt-conn.ob{color:var(--warn)}
+
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:20px 40px; flex:1; min-width:320px}
+  .gi{display:flex; gap:12px; align-items:flex-start}
+  .gi .ic{flex:none; width:38px; height:38px; border-radius:9px; background:var(--panel2); display:flex; align-items:center; justify-content:center; color:var(--dim)}
+  .gi .lab{font-size:12.5px; color:var(--dim)}
+  .gi .val{font-size:14.5px; font-weight:600; margin-top:1px}
+
+  /* 弹窗 */
+  #mask{display:none; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50; align-items:center; justify-content:center}
+  #modal{background:var(--panel); border:1px solid var(--line); border-radius:14px; width:min(480px,92vw); max-height:88vh; overflow:auto; padding:22px 26px; box-shadow:0 10px 40px rgba(0,0,0,.5)}
+  .m-title{font-size:16.5px; font-weight:700; display:flex; align-items:center}
+  .m-close{margin-left:auto; cursor:pointer; color:var(--dim); font-size:22px; line-height:1; padding:0 4px}
+  .m-close:hover{color:var(--txt)}
+  .m-sec{margin-top:18px}
+  .m-sec > b{display:block; font-size:13.5px; margin-bottom:8px}
+  .radio-row{display:flex; gap:24px; align-items:center}
+  .radio-row label{display:flex; gap:6px; align-items:center; cursor:pointer; font-size:13.5px}
+  .m-hint{font-size:12.5px; color:var(--dim); margin-top:6px}
+  .m-hint input{width:64px; text-align:center; padding:3px 6px}
+  .m-foot{display:flex; justify-content:flex-end; gap:12px; margin-top:24px}
+
+  /* 其他 */
+  table{width:100%; border-collapse:collapse; font-size:12.5px}
+  td{padding:4px 6px; border-top:1px solid var(--line); vertical-align:top}
+  td.t{white-space:nowrap; color:var(--dim); font-variant-numeric:tabular-nums}
+  .lv-info{color:var(--info)} .lv-warn{color:var(--warn)} .lv-bad{color:var(--bad)}
+  #chart{width:100%; height:180px}
+  #banner{display:none; background:var(--panel); border:1px solid var(--bad); border-radius:12px; padding:12px 18px; margin-bottom:16px; align-items:center; gap:14px; flex-wrap:wrap}
+  #banner .big{font-size:20px; font-weight:700; color:var(--bad); font-variant-numeric:tabular-nums}
+  #gate{max-width:360px; margin:12vh auto; text-align:center}
+  #gate input{width:100%; margin:14px 0; padding:9px 12px; font-size:15px; text-align:center}
+  .toast{position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--accent); color:#fff; padding:8px 20px; border-radius:20px; font-weight:600; opacity:0; transition:.3s; pointer-events:none; z-index:99}
+  .toast.err{background:var(--bad)}
+  details.adv summary{cursor:pointer; color:var(--dim); font-size:13px; user-select:none}
+  details.adv summary:hover{color:var(--txt)}
+  .row{display:flex; gap:14px; flex-wrap:wrap; margin-top:10px}
+
+  /* 页脚 */
+  .ftr{text-align:center; color:var(--dim); font-size:12px; padding:18px 0 4px; border-top:1px solid var(--line); margin-top:8px}
+  .ftr b{color:var(--accent); font-weight:600}
+
+  @media (max-width:560px){
+    .grid2{grid-template-columns:1fr; gap:14px}
+    input,select{font-size:16px !important}
+    #evt tr{display:block}
+    #evt td{display:block; width:100%}
+    #evt td.t{border-top:0; padding-bottom:0; color:var(--dim)}
+  }
+</style>
+</head>
+<body>
+
+<div id="gate" class="card" style="display:none">
+  <div class="hd" style="justify-content:center">
+    <div class="logo">
+      <svg viewBox="0 0 64 64" width="22" height="22" fill="none">
+        <rect x="10" y="19" width="38" height="26" rx="6" stroke="#eafcff" stroke-width="5"/>
+        <rect x="50.5" y="26" width="5" height="12" rx="2" fill="#eafcff"/>
+        <path d="M28 23L18 33.5h6L22.5 41.5 34.5 29.5h-6L32 23z" fill="#eafcff"/>
+      </svg>
+    </div>
+    <h1>电源管理</h1>
+  </div>
+  <div class="sub">请输入面板口令</div>
+  <input id="pwd" type="password" placeholder="口令（首装默认 admin）" onkeydown="if(event.key==='Enter')login()">
+  <button onclick="login()">进入</button>
+  <div id="gateErr" class="sub" style="color:var(--bad); margin-top:8px"></div>
+</div>
+
+<div id="app" style="display:none">
+  <div class="hd">
+    <div class="logo">
+      <svg viewBox="0 0 64 64" width="22" height="22" fill="none">
+        <rect x="10" y="19" width="38" height="26" rx="6" stroke="#eafcff" stroke-width="5"/>
+        <rect x="50.5" y="26" width="5" height="12" rx="2" fill="#eafcff"/>
+        <path d="M28 23L18 33.5h6L22.5 41.5 34.5 29.5h-6L32 23z" fill="#eafcff"/>
+      </svg>
+    </div>
+    <h1>电源管理</h1>
+    <span id="updAt" class="sub" style="font-size:12.5px"></span>
+    <span id="hdrStatus" class="badge ok">在线</span>
+    <div class="theme" onclick="toggleTheme()" title="切换主题">
+      <svg id="icMoon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round">
+        <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/>
+      </svg>
+    </div>
+  </div>
+
+  <div id="banner">
+    <span>⚠️ 预关机已排定</span>
+    <span class="big" id="bnLeft">--s</span>
+    <span id="bnReason" class="sub"></span>
+    <span id="bnMode" class="badge"></span>
+    <button class="ghost" onclick="cancelShutdown()">取消关机</button>
+  </div>
+
+  <div class="card">
+    <div style="display:flex; align-items:flex-start; gap:16px">
+      <div style="flex:1">
+        <div style="font-size:15px; font-weight:700">启用 UPS 支持</div>
+        <div class="sub" style="margin-top:2px">连接 UPS，可以在电力中断时自动让系统安全关机，以保护数据安全。</div>
+      </div>
+      <label class="switch"><input type="checkbox" id="swEn" onchange="toggleEnable(this.checked)"><span class="sl"></span></label>
+    </div>
+    <div style="margin-top:14px">
+      <button class="ghost" onclick="openModal()">编辑 UPS 规则</button>
+      <span id="enHint" class="sub" style="margin-left:10px"></span>
+    </div>
+
+    <div class="ups-wrap">
+      <div class="batt-col">
+        <div class="battery" id="batt"><div class="batt-fill" id="battFill" style="height:100%"></div></div>
+        <div class="batt-pct" id="battPct">--</div>
+        <div class="batt-conn" id="battConn">--</div>
+      </div>
+      <div class="grid2">
+        <div class="gi"><div class="ic"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg></div><div><div class="lab">品牌型号</div><div class="val" id="gModel">--</div></div></div>
+        <div class="gi"><div class="ic"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><path d="M13 2L5 13.5h6L10 22l8-11.5h-6L13 2z"/></svg></div><div><div class="lab">预估可供电</div><div class="val" id="gRun">--</div></div></div>
+        <div class="gi"><div class="ic"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg></div><div><div class="lab">关机等待规则</div><div class="val" id="gRule">--</div></div></div>
+        <div class="gi"><div class="ic"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="2.5" y="8" width="16" height="9" rx="2"/><path d="M21.5 11v3"/><rect x="5" y="10.5" width="7" height="4" rx="1" fill="currentColor" stroke="none"/></svg></div><div><div class="lab">当前供电类型</div><div class="val" id="gSrc">--</div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="sub" style="margin-bottom:8px">电量 / 负载·输出功率（近 6 小时）</div>
+    <canvas id="chart"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="sub" style="margin-bottom:6px">事件日志</div>
+    <div style="max-height:240px; overflow:auto">
+      <table id="evt"></table>
+    </div>
+  </div>
+
+  <div class="card">
+    <details class="adv">
+      <summary>高级设置（提醒阈值 / 通知 / 口令）</summary>
+      <div class="row">
+        <label class="f"><b>低电提醒阈值 %</b><input id="sLow" type="number" min="0" max="100"></label>
+        <label class="f"><b>采样间隔（秒）</b><input id="sPoll" type="number" min="3" max="300"></label>
+        <label class="f"><b>铁牛通知栏推送</b><select id="sNf"><option value="1">开启（断电/低电/恢复市电）</option><option value="0">关闭</option></select></label>
+      </div>
+      <div class="row">
+        <label class="f" style="flex:1; min-width:280px"><b>关机命令（容器内路径；挂了 /host 时自动 chroot）</b><input id="sCmd" style="width:100%"></label>
+        <label class="f"><b>修改面板口令</b><input id="sPwd" type="password" placeholder="留空 = 不改"></label>
+        <button style="align-self:flex-end; margin-bottom:2px" onclick="saveAdv()">保存高级设置</button>
+      </div>
+      <div class="sub" style="margin-top:8px">「启用 UPS 支持」开关即生效，无需其他开关配合。</div>
+    </details>
+  </div>
+
+  <div class="ftr">© 2026 电源管理 <b>v0.1.3</b> · Crafted by 西了个瓜</div>
+</div>
+
+<!-- 编辑 UPS 规则弹窗 -->
+<div id="mask">
+  <div id="modal">
+    <div class="m-title">编辑 UPS 规则 <span class="m-close" onclick="closeModal()">×</span></div>
+    <div class="m-sec">
+      <b>关机等待方式</b>
+      <div class="radio-row">
+        <label><input type="radio" name="smode" value="battery" checked> 直到电量不足</label>
+        <label><input type="radio" name="smode" value="timer"> 自定义时间</label>
+      </div>
+      <div class="m-hint" id="hintBattery">当UPS电池供电的剩余电量 <input id="mCrit" type="number" min="5" max="90" value="15"> % 时，系统将自动关机。</div>
+      <div class="m-hint" id="hintTimer" style="display:none">市电中断持续 <input id="mDelay" type="number" min="1" max="120" value="10"> 分钟后，系统将自动关机。</div>
+    </div>
+    <div class="m-sec">
+      <b>低电提醒阈值 %</b>
+      <div class="m-hint">电量低于该值时推送提醒（不影响关机）<input id="mLow" type="number" min="0" max="100" style="margin-left:8px"></div>
+    </div>
+    <div class="m-foot">
+      <button class="ghost" onclick="closeModal()">取消</button>
+      <button onclick="saveRule()">确定</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let TOKEN = localStorage.getItem('ups_token') || '';
+let LAST = null;
+let _darkCache = null;
+
+function isDark(){
+  // 缓存当前主题判定（每次切换主题时刷新）
+  if (_darkCache === null) _darkCache = !document.documentElement.classList.contains('light');
+  return _darkCache;
+}
+function toggleTheme(){
+  const html = document.documentElement;
+  if (html.classList.contains('light')){
+    html.classList.remove('light');
+    localStorage.setItem('ups_theme','dark');
+  } else {
+    html.classList.add('light');
+    localStorage.setItem('ups_theme','light');
+  }
+  _darkCache = null;
+  // 重画图表（用新主题色）
+  if (LAST) drawChart(_lastRows || []);
+}
+function toast(msg, err){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast' + (err ? ' err' : '');
+  t.style.opacity = 1; clearTimeout(t._h);
+  t._h = setTimeout(()=>t.style.opacity = 0, 2200);
+}
+async function api(path, opt){
+  opt = opt || {};
+  opt.headers = Object.assign({'Content-Type':'application/json'}, opt.headers||{});
+  opt.headers['Cookie'] = 'ups_token=' + TOKEN;
+  const r = await fetch(path, opt);
+  if (r.status === 401){ showGate(); throw new Error('unauthorized'); }
+  return r.json();
+}
+function showGate(){
+  document.getElementById('gate').style.display='block';
+  document.getElementById('app').style.display='none';
+}
+async function login(){
+  const r = await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({password: document.getElementById('pwd').value})});
+  if (r.ok){ TOKEN=''; document.getElementById('gate').style.display='none';
+    document.getElementById('app').style.display='block'; refresh(); }
+  else { document.getElementById('gateErr').textContent = '口令不对，再试试'; }
+}
+function esc(s){ return String(s??'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function render(s){
+  LAST = s;
+  const r = s.reading || {};
+  const c = s.cfg;
+  const st = s.status;
+  // 顶部状态徽标
+  const hs = document.getElementById('hdrStatus');
+  if (st==='on_battery'){ hs.textContent='电池供电'; hs.className='badge warn'; }
+  else if (s.connected){ hs.textContent='在线'; hs.className='badge ok'; }
+  else { hs.textContent='未连接'; hs.className='badge'; }
+  // 开关
+  document.getElementById('swEn').checked = !!c.enable_shutdown;
+  document.getElementById('enHint').textContent = c.enable_shutdown
+    ? '已启用：满足规则时自动关机'
+    : '未启用：仅监控与提醒';
+  // 电池
+  const chg = r.charge_pct;
+  const batt = document.getElementById('batt'), fill = document.getElementById('battFill');
+  let cls = '', fcls = '';
+  if (st===null || st==='driver_lost' || (!s.connected && !r.model)) { cls='off'; fcls='off'; }
+  else if (chg!==null && chg<=15) { cls='bad'; fcls='bad'; }
+  else if (chg!==null && chg<=30) { cls='warn'; fcls='warn'; }
+  batt.className = 'battery ' + cls;
+  fill.className = 'batt-fill ' + fcls;
+  fill.style.height = (chg===null ? 0 : Math.max(5, Math.round(chg * 0.88))) + '%';
+  document.getElementById('battPct').textContent = chg===null ? '--' : '剩余电量 ' + chg + '%';
+  const bc = document.getElementById('battConn');
+  if (st==='on_battery'){ bc.textContent='电池供电中'; bc.className='batt-conn ob'; }
+  else if (s.connected){ bc.textContent='正常连接'; bc.className='batt-conn on'; }
+  else { bc.textContent='未连接'; bc.className='batt-conn'; }
+  // 2x2 网格
+  document.getElementById('gModel').textContent =
+    (r.mfr ? r.mfr + ' / ' : '') + (r.model || '--');
+  document.getElementById('gRun').textContent =
+    r.runtime_min===null ? '--' : (r.runtime_min>=999 ? '市电供电中' : r.runtime_min + ' 分钟');
+  if (c.shutdown_mode === 'timer')
+    document.getElementById('gRule').textContent = c.shutdown_delay_min + '分钟后关机';
+  else
+    document.getElementById('gRule').textContent = '直到电量不足（<' + c.shutdown_batt_pct + '% 时关机）';
+  const gs = document.getElementById('gSrc');
+  if (st==='on_battery'){ gs.textContent='电池供电'; gs.style.color='var(--warn)'; }
+  else if (st==='online'){ gs.textContent='市电供电'; gs.style.color=''; }
+  else { gs.textContent = s.connected ? '未知' : '--'; gs.style.color='var(--dim)'; }
+  // banner
+  const b = document.getElementById('banner');
+  if (s.pending_shutdown){
+    b.style.display='flex';
+    document.getElementById('bnLeft').textContent = s.pending_shutdown.left_sec + 's';
+    document.getElementById('bnReason').textContent = s.pending_shutdown.reason;
+    const bm = document.getElementById('bnMode');
+    bm.textContent = s.pending_shutdown.will_exec ? '将执行关机' : '开关未启用，不会真关';
+    bm.className = 'badge ' + (s.pending_shutdown.will_exec ? 'bad' : 'warn');
+  } else b.style.display='none';
+  // 高级设置（未手改时跟随服务端）
+  if (!document.getElementById('sLow')._touched){
+    document.getElementById('sLow').value = c.low_batt_pct;
+    document.getElementById('sPoll').value = c.poll_sec;
+    document.getElementById('sNf').value = (c.notify_enabled === false) ? '0' : '1';
+    document.getElementById('sCmd').value = c.shutdown_command || '';
+  }
+  document.getElementById('updAt').textContent = '更新于 ' + new Date().toLocaleTimeString();
+}
+
+// ---- 弹窗 ----
+function openModal(){
+  const c = LAST.cfg;
+  const mode = c.shutdown_mode === 'timer' ? 'timer' : 'battery';
+  document.querySelector('input[name=smode][value=battery]').checked = mode==='battery';
+  document.querySelector('input[name=smode][value=timer]').checked = mode==='timer';
+  document.getElementById('mCrit').value = c.shutdown_batt_pct;
+  document.getElementById('mDelay').value = c.shutdown_delay_min;
+  document.getElementById('mLow').value = c.low_batt_pct;
+  syncHint();
+  document.getElementById('mask').style.display='flex';
+}
+function closeModal(){ document.getElementById('mask').style.display='none'; }
+function syncHint(){
+  const m = document.querySelector('input[name=smode]:checked').value;
+  document.getElementById('hintBattery').style.display = m==='battery' ? '' : 'none';
+  document.getElementById('hintTimer').style.display = m==='timer' ? '' : 'none';
+}
+document.querySelectorAll('input[name=smode]').forEach(el=>el.addEventListener('change', syncHint));
+document.getElementById('mask').addEventListener('click', e=>{ if (e.target.id==='mask') closeModal(); });
+async function saveRule(){
+  const mode = document.querySelector('input[name=smode]:checked').value;
+  const body = {
+    shutdown_mode: mode,
+    shutdown_batt_pct: +document.getElementById('mCrit').value,
+    shutdown_delay_min: +document.getElementById('mDelay').value,
+    low_batt_pct: +document.getElementById('mLow').value,
+  };
+  const r = await api('/api/settings', {method:'POST', body: JSON.stringify(body)});
+  if (r.ok){ closeModal(); toast('规则已保存'); refresh(); }
+  else toast(r.error||'保存失败', true);
+}
+async function toggleEnable(on){
+  const r = await api('/api/settings', {method:'POST', body: JSON.stringify({enable_shutdown: on})});
+  if (r.ok){ toast(on ? '已启用自动关机' : '已关闭（仅监控）'); refresh(); }
+  else { toast(r.error||'失败', true); refresh(); }
+}
+async function saveAdv(){
+  const body = {
+    low_batt_pct:+document.getElementById('sLow').value,
+    poll_sec:+document.getElementById('sPoll').value,
+    notify_enabled: document.getElementById('sNf').value==='1',
+    shutdown_command: document.getElementById('sCmd').value,
+  };
+  const p = document.getElementById('sPwd').value;
+  if (p) body.password = p;
+  const r = await api('/api/settings', {method:'POST', body: JSON.stringify(body)});
+  if (r.ok){ document.getElementById('sPwd').value='';
+    document.getElementById('sLow')._touched=false;
+    toast('已保存' + (p ? '（口令已更新）' : '')); refresh(); }
+  else toast(r.error||'保存失败', true);
+}
+['sLow','sPoll'].forEach(id=>{
+  document.getElementById(id).addEventListener('input', e=>e.target._touched=true);
+});
+async function cancelShutdown(){
+  await api('/api/cancel_shutdown', {method:'POST', body:'{}'});
+  toast('已取消预关机'); refresh();
+}
+
+let _lastRows = null;
+async function refresh(){
+  try{
+    const s = await api('/api/status');
+    render(s);
+    const hist = await api('/api/history?minutes=360');
+    _lastRows = hist.rows;
+    drawChart(_lastRows);
+    const ev = await api('/api/events');
+    document.getElementById('evt').innerHTML = ev.rows.map(r=>{
+      const d = new Date(r[0]*1000);
+      return '<tr><td class="t">'+d.toLocaleString()+'</td><td class="lv-'+r[1]+'">'+
+        esc(r[3])+'</td></tr>';
+    }).join('') || '<tr><td class="t">暂无事件</td></tr>';
+  }catch(e){ if (e.message!=='unauthorized') console.warn(e); }
+}
+function drawChart(rows){
+  const cv = document.getElementById('chart');
+  const dpr = window.devicePixelRatio||1;
+  const W = cv.clientWidth, H = 180;
+  cv.width = W*dpr; cv.height = H*dpr;
+  const g = cv.getContext('2d'); g.scale(dpr,dpr); g.clearRect(0,0,W,H);
+  const dark = isDark();
+  const lineC = dark ? '#2a343d' : '#dcdcdc';
+  const dimC = dark ? '#9c9c9c' : '#555';
+  const acc = dark ? '#4cc38a' : '#3fae7f';
+  const info = '#4a9ad8';
+  if (!rows || rows.length<2){ g.fillStyle=dimC; g.fillText('暂无历史数据', 20, 90); return; }
+  // 电量与负载都是百分比，共用左轴 0-100%；输出功率是瓦特，必须另配一根轴 ——
+  // 早前把 W 按 v/100 画在百分比轴上，23W 贴在图底，看着就像"负载一直没动静"。
+  const hasLoad = rows.some(r => r[3] != null);
+  const hasW = rows.some(r => r[7] != null);
+  const useW = !hasLoad && hasW;
+  let wMax = 0;
+  if (useW) rows.forEach(r => { if (r[7] != null && r[7] > wMax) wMax = r[7]; });
+  const wTop = useW ? Math.max(10, Math.ceil(wMax * 1.25 / 10) * 10) : 100;
+  const x0=34, x1=(useW ? W-42 : W-10), y0=10, y1=H-22;
+  const t0=rows[0][0], t1=rows[rows.length-1][0];
+  const X = t => x0 + (t-t0)/Math.max(1,(t1-t0))*(x1-x0);
+  const Y = v => y1 - v/100*(y1-y0);          // 百分比轴（电量 / 负载）
+  const Yw = v => y1 - v/wTop*(y1-y0);        // 瓦特轴（仅回退模式）
+  g.strokeStyle=lineC; g.lineWidth=1;
+  for (let v=0; v<=100; v+=25){ g.beginPath(); g.moveTo(x0,Y(v)); g.lineTo(x1,Y(v)); g.stroke();
+    g.fillStyle=dimC; g.font='10px sans-serif'; g.fillText(v+'%', 6, Y(v)+3); }
+  if (useW){
+    g.font='10px sans-serif';
+    for (let i=0; i<=4; i++){ const v=wTop*i/4;
+      g.fillStyle=dimC; g.fillText(Math.round(v)+'W', x1+3, Yw(v)+3); }
+  }
+  function series(idx, color, Yf){
+    g.strokeStyle=color; g.lineWidth=1.6; g.beginPath();
+    rows.forEach((r,i)=>{ const x=X(r[0]), y=Yf(r[idx]); i?g.lineTo(x,y):g.moveTo(x,y); });
+    g.stroke();
+  }
+  if (hasLoad) series(3, info, Y);           // 负载 %
+  else if (hasW) series(7, info, Yw);        // 输出功率 W（走瓦特轴）
+  series(2, acc, Y);    // charge
+  const a = new Date(t0*1000), b = new Date(t1*1000);
+  g.fillStyle=dimC; g.font='10px sans-serif';
+  g.fillText(a.toLocaleTimeString(), x0, H-6);
+  g.fillText(b.toLocaleTimeString(), x1-56, H-6);
+  g.fillStyle=acc; g.fillText('— 电量', W-150, 14);
+  g.fillStyle=info;
+  if (hasLoad) g.fillText('— 负载 %', W-100, 14);
+  else if (hasW) g.fillText('— 输出功率 W（右轴）', W-150, 14);
+}
+(async function init(){
+  try{
+    const s = await api('/api/status');
+    document.getElementById('gate').style.display='none';
+    document.getElementById('app').style.display='block';
+    render(s);
+    const hist = await api('/api/history?minutes=360');
+    _lastRows = hist.rows;
+    drawChart(_lastRows);
+    const ev=await api('/api/events');
+    document.getElementById('evt').innerHTML = ev.rows.map(r=>
+      '<tr><td class="t">'+new Date(r[0]*1000).toLocaleString()+'</td><td class="lv-'+r[1]+'">'+esc(r[3])+'</td></tr>').join('');
+    setInterval(refresh, 3000); return;
+  }catch(e){
+    console.warn('init fail:', e);
+    document.getElementById('gateErr').textContent = '自动登录失败: ' + (e && e.message || e);
+  }
+  showGate();
+  setInterval(()=>{ if (document.getElementById('app').style.display!=='none') refresh(); }, 3000);
+})();
+</script>
+</body>
+</html>

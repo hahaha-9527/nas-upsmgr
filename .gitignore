@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 本地环境变量
+.env
+.env.local
+
+# 运行时数据与日志：里面有面板口令与历史读数，绝对不要提交
+data/
+*.log
+
+# 发布包与备份
+*.tpk
+*.zip
+*.tar.gz
+*.bak
+*.bak-*
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

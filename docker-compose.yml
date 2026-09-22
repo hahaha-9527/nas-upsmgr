@@ -1,0 +1,25 @@
+services:
+  upsmon:
+    build:
+      context: .
+      # 国内构建慢可启用：
+      # args:
+      #   APT_MIRROR: mirrors.tuna.tsinghua.edu.cn
+    image: upsmon:0.1.3
+    container_name: upsmon-app
+    # privileged + 全量 /dev：读 UPS 的 USB HID 设备（/dev/hidraw*）必须
+    privileged: true
+    devices:
+      - /dev:/dev
+    # host 网络：面板直接监听 NAS 的 9750 端口
+    network_mode: host
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      # 配置与历史数据（upsmgr.json / upsmgr.db）
+      - ./data:/data
+      # 程序文件挂载进去，改完 docker compose up -d --force-recreate 即生效
+      - ./app:/opt/app:ro
+      # 想让容器执行的真关机作用到宿主机，把宿主根挂进来（shutdown_command 会自动 chroot）：
+      # - /:/host

@@ -92,8 +92,8 @@ python tools/verify.py http://NAS_IP:9750 口令
 不需要应用中心，有 Docker 就能跑：
 
 ```bash
-tar -xzf nas-upsmgr-v0.1.3.tar.gz     # Windows 用户用 .zip
-cd nas-upsmgr-v0.1.3
+tar -xzf nas-upsmgr-v0.1.4.tar.gz     # Windows 用户用 .zip
+cd nas-upsmgr-v0.1.4
 docker compose up -d --build
 ```
 
@@ -102,7 +102,7 @@ docker compose up -d --build
 国内构建慢时换 APT 源：
 
 ```bash
-docker build --build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn -t upsmon:0.1.3 .
+docker build --build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn -t upsmon:0.1.4 .
 docker compose up -d            # 镜像已存在则不再构建
 ```
 

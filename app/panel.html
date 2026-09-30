@@ -334,7 +334,9 @@ function render(s){
   const st = s.status;
   // 顶部状态徽标
   const hs = document.getElementById('hdrStatus');
+  const sh = s.selfheal || {};
   if (st==='on_battery'){ hs.textContent='电池供电'; hs.className='badge warn'; }
+  else if (sh.stale && s.connected){ hs.textContent='恢复中'; hs.className='badge warn'; }
   else if (s.connected){ hs.textContent='在线'; hs.className='badge ok'; }
   else { hs.textContent='未连接'; hs.className='badge'; }
   // 开关
@@ -355,6 +357,8 @@ function render(s){
   document.getElementById('battPct').textContent = chg===null ? '--' : '剩余电量 ' + chg + '%';
   const bc = document.getElementById('battConn');
   if (st==='on_battery'){ bc.textContent='电池供电中'; bc.className='batt-conn ob'; }
+  else if (sh.stale && s.connected){ bc.textContent='正在自动恢复…'; bc.className='batt-conn ob'; }
+  else if (sh.settling){ bc.textContent='读数校准中'; bc.className='batt-conn on'; }
   else if (s.connected){ bc.textContent='正常连接'; bc.className='batt-conn on'; }
   else { bc.textContent='未连接'; bc.className='batt-conn'; }
   // 2x2 网格

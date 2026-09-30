@@ -5,7 +5,7 @@
   - 驱动抽象：hid（USB HID UPS，探测 + 联调校准） / mock（模拟 UPS，可人工制造断电事件）
   - SQLite 落库：读数历史 + 事件日志（默认保留 7 天）
   - 断电策略引擎：低电量 / 延迟阈值 -> 预关机倒计时 -> 执行关机命令
-    （enable_shutdown 默认 false；dry_run 默认 true，只打日志不真关）
+    （唯一总开关是 enable_shutdown，默认 false；dry_run 是历史遗留字段，策略已不再引用）
   - 内嵌 Web 面板：状态卡 / 历史 / 事件 / 设置 / 模拟控制台，口令闸门
 
 只依赖 Python 3 标准库。
@@ -16,7 +16,10 @@ import hashlib
 import html
 import json
 import os
+import shutil
+import signal
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -29,7 +32,7 @@ try:                       # Linux 专属；Windows 本地开发兜底
 except ImportError:
     fcntl = None
 
-APP_VERSION = "v0.1.3"
+APP_VERSION = "v0.1.4"
 APP_NAME = "电源管理"
 
 DEFAULT_CONFIG = {
@@ -47,6 +50,12 @@ DEFAULT_CONFIG = {
     "pre_shutdown_commands": [], # 关机前逐条执行（如停容器）
     "password": "admin",         # 面板口令（首装默认，务必在面板里改）
     "history_days": 7,
+    "devnode_sync": True,             # 容器内 USB 设备节点自动同步（热插拔后 libusb 才认得新节点）
+    "nut_restart_min_interval": 30,   # 两次重拉 NUT 驱动的最小间隔（秒）
+    "nut_restart_wait": 15,           # 重拉后等 upsc 恢复读数的最长时间（秒）
+    "lost_grace_sec": 120,            # 读数失败多久后才判定「通讯丢失」（短时抖动不误报）
+    "settle_sec": 20,                 # 重连后的读数不可信时长：期间不触发告警/关机判据
+    "nut_ups_name": "",               # NUT 里的 UPS 名（留空 = 读 /etc/nut/ups.conf）
     "notify_enabled": True,      # 关键事件同步到铁牛通知栏（容器内 /host/userdata/db 可见时生效）
     "notify_uid": 1000,          # 通知目标用户 uid（Feige=1000）
 }
@@ -285,6 +294,14 @@ class HidUpsDriver:
         self._probe()
         return self.dev is not None
 
+    def can_report(self):
+        """能不能真的产出读数（校准映射写进 hid_map.json 之后才算）。
+
+        没校准时 read() 只能给 status=detected 且字段全 None —— 若允许 auto 选它，
+        面板会拿"识别到了"冒充健康，把真正的通讯中断盖过去（UPS 场景很危险）。
+        """
+        return bool(self.map.get("reports") or self.map.get("fields"))
+
     def read(self):
         if not self.available():
             return None
@@ -394,6 +411,13 @@ class NutBridgeDriver:
                 out[k.strip()] = v.strip()
         return out
 
+    def reset(self):
+        """NUT 栈被重拉后清掉探测/读数缓存，下一轮立即重新探测（否则要等 30s 节流）。"""
+        self._cache = None
+        self._cache_t = 0.0
+        self._probe_done = False
+        self._probe_t = 0.0
+
     def read(self):
         # 5s 缓存
         if self._cache and time.time() - self._cache_t < 5:
@@ -493,7 +517,8 @@ def make_driver(cfg):
     nut_drv = NutBridgeDriver(cfg)
     hid_drv = HidUpsDriver(cfg)
     nut_ok = nut_drv.available()
-    hid_ok = hid_drv.available()
+    # HID 没校准时读不出任何字段，不能算可用：否则 auto 会选它并用 detected 冒充健康
+    hid_ok = hid_drv.available() and hid_drv.can_report()
     if nut_ok and hid_ok:
         return hid_drv if preferred == "hid" else nut_drv
     if nut_ok:
@@ -502,6 +527,289 @@ def make_driver(cfg):
         return hid_drv
     log("driver: auto 模式下 NUT 与 HID 都不可用，回落 mock（仅监控）")
     return MockDriver(cfg)
+
+
+# ============================================================ 容器内 USB 设备节点同步
+# 特权容器用的是自己的 devtmpfs，不是宿主的 /dev：UPS 一拔一插（或掉线重连），
+# 宿主会重建 /dev/bus/usb/001/00N，而容器里永远停留在启动瞬间那几个节点 →
+# libusb 打开新设备直接 No such device → upsd 判定 Data stale → upsc 非零 →
+# 面板报「UPS 通讯丢失」，且没有任何东西会去救它。
+_SYS_UEVENT_GLOBS = (
+    "/sys/bus/usb/devices/*/uevent",
+    "/sys/class/hidraw/*/uevent",
+    "/sys/class/usbmisc/*/uevent",
+)
+
+# 本进程自己建出来的设备节点 + 它们被观测到「sysfs 里消失」的次数。
+# 设备拔掉（或 hid-generic 被 libusb 抢走）之后，sysfs 不再描述它，但我们之前
+# mknod 出来的节点会永久留着变成幽灵节点：打开报 ENODEV，还会让 HID 驱动每轮
+# 探测失败刷日志。这份记录用来把它们回收掉。
+_DEVNODE_CREATED = set()
+_DEVNODE_MISS = {}
+_DEVNODE_MISS_MAX = 3      # 连续 N 轮找不着才删，避免重枚举瞬间的抖动误删
+
+
+def _uevent_devnode(path):
+    """从 sysfs 的 uevent 里读出 DEVNAME / MAJOR / MINOR。"""
+    info = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    info[k] = v
+    except Exception:
+        return None
+    devname = info.get("DEVNAME")
+    if not devname:
+        # /sys/class/hidraw/hidraw0/uevent 只有 MAJOR/MINOR，没有 DEVNAME：
+        # 退回用类目录名（只在 /sys/class 下这么做，usb 设备目录名不是设备节点名）
+        parent = os.path.dirname(path)
+        if parent.startswith("/sys/class/"):
+            devname = os.path.basename(parent)
+    if not devname:
+        return None
+    try:
+        return devname, int(info["MAJOR"]), int(info["MINOR"])
+    except Exception:
+        return None
+
+
+def sync_usb_devnodes():
+    """按 sysfs 补齐容器内缺失/过期的字符设备节点，返回本次新建的节点路径列表。
+
+    只在真的缺失或 rdev 对不上时动手；已存在的节点不动（避免打断正在读设备的进程）。
+    设备消失后我们自己建的节点会被回收（见 _gc_devnodes）。
+    """
+    created = []
+    if not os.path.isdir("/sys"):
+        return created
+    uevents = []
+    wanted = set()
+    for pat in _SYS_UEVENT_GLOBS:
+        uevents.extend(sorted(glob.glob(pat)))
+    for up in uevents:
+        got = _uevent_devnode(up)
+        if not got:
+            continue
+        devname, maj, mnr = got
+        node = devname if devname.startswith("/") else "/dev/" + devname
+        wanted.add(node)
+        want = os.makedev(maj, mnr)
+        try:
+            st = os.stat(node)
+            if stat.S_ISCHR(st.st_mode) and st.st_rdev == want:
+                continue
+            os.remove(node)          # 节点在但指向旧设备（重枚举换了次序号）
+        except FileNotFoundError:
+            pass
+        except Exception:
+            continue
+        try:
+            os.makedirs(os.path.dirname(node), exist_ok=True)
+            os.mknod(node, stat.S_IFCHR | 0o666, want)
+            created.append(node)
+            _DEVNODE_CREATED.add(node)
+            _DEVNODE_MISS.pop(node, None)
+        except Exception as e:
+            log("devsync: mknod %s 失败: %s" % (node, e))
+    _gc_devnodes(wanted)
+    return created
+
+
+def _gc_devnodes(wanted):
+    """回收「本进程建过、但 sysfs 里已经没有这个设备」的节点。
+
+    只碰 _DEVNODE_CREATED 里的路径 —— 容器 devtmpfs 自带的节点（如 /dev/null、
+    根 Hub）一概不动。消失要连续 _DEVNODE_MISS_MAX 轮才算数：USB 重新枚举时
+    设备会在 sysfs 里闪断一瞬，立刻删会在下一轮又被重建，进而误判成「再次插拔」
+    白白重拉一次 NUT 栈。
+    """
+    stale = []
+    for node in sorted(_DEVNODE_CREATED):
+        if node in wanted:
+            _DEVNODE_MISS.pop(node, None)
+            continue
+        n = _DEVNODE_MISS.get(node, 0) + 1
+        if n < _DEVNODE_MISS_MAX:
+            _DEVNODE_MISS[node] = n
+            continue
+        _DEVNODE_MISS.pop(node, None)
+        stale.append(node)
+    for node in stale:
+        try:
+            os.remove(node)
+            log("devsync: 清理失效节点 %s" % node)
+        except Exception:
+            pass
+        _DEVNODE_CREATED.discard(node)
+
+
+# ============================================================ 容器内 NUT 栈看门狗
+class NutStack:
+    """容器内 NUT（usbhid-ups 驱动 + upsd 数据服务器）的管家。
+
+    容器里没有 systemd / supervisor：UPS 拔插或掉线重连之后，usbhid-ups 抓着的
+    还是那个已经消失的设备句柄，upsd 只会一直报 Data stale，而且永远不会自愈。
+    这里的职责：补设备节点 -> 停掉旧驱动 -> 重新拉起 -> 等 upsc 恢复读数。
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        self.last_restart = 0.0
+        self.restart_count = 0
+        self.last_error = ""
+
+    # ---- 进程查找：直接扫 /proc，不依赖 ps 命令 ----
+    @staticmethod
+    def _pids(name):
+        out = []
+        try:
+            for pid in os.listdir("/proc"):
+                if not pid.isdigit():
+                    continue
+                try:
+                    with open("/proc/%s/cmdline" % pid, "rb") as f:
+                        raw = f.read()
+                    with open("/proc/%s/stat" % pid, "r") as f:
+                        state = f.read().rsplit(")", 1)[-1].split()[0]
+                except Exception:
+                    continue
+                if not raw or state == "Z":
+                    continue
+                argv = [p.decode("utf-8", "replace") for p in raw.split(b"\x00") if p]
+                if argv and os.path.basename(argv[0]) == name:
+                    out.append((int(pid), argv))
+        except Exception:
+            pass
+        return out
+
+    def driver_pids(self):
+        return self._pids("usbhid-ups")
+
+    def server_pids(self):
+        return self._pids("upsd")
+
+    def ups_name(self):
+        return (self.cfg.get("nut_ups_name") or "").strip() or self._conf_ups_name() or ""
+
+    @staticmethod
+    def _conf_ups_name():
+        """从 /etc/nut/ups.conf 取第一个 UPS 名（run.sh 每次启动都会重写该文件）。"""
+        try:
+            with open("/etc/nut/ups.conf", "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if s.startswith("[") and s.endswith("]"):
+                        return s[1:-1]
+        except Exception:
+            pass
+        return None
+
+    def resync(self):
+        """补齐设备节点（热插拔后容器里才有新节点）。"""
+        return sync_usb_devnodes()
+
+    def _kill(self, pids, sig=signal.SIGTERM):
+        for pid, _ in pids:
+            try:
+                os.kill(pid, sig)
+            except Exception:
+                pass
+
+    def _reap(self):
+        """本进程通常是容器 PID 1：旧驱动被杀后会留下僵尸，得主动回收。"""
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                break
+            except AttributeError:      # 非 POSIX（Windows 本地自测）
+                return
+            if not pid:
+                break
+
+    def _spawn(self, argv):
+        try:
+            subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+                env=dict(os.environ,
+                         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"))
+            return True
+        except Exception as e:
+            self.last_error = "启动 %s 失败: %r" % (" ".join(argv), e)
+            log("nut: %s" % self.last_error)
+            return False
+
+    def _upsc_ok(self):
+        name = self.ups_name()
+        if not name:
+            self.last_error = "拿不到 UPS 名（ups.conf 为空且未配置 nut_ups_name）"
+            return False
+        try:
+            p = subprocess.run(["upsc", "%s@127.0.0.1:3493" % name],
+                               capture_output=True, text=True, timeout=4)
+        except Exception as e:
+            self.last_error = "upsc 调用失败: %r" % e
+            return False
+        if p.returncode != 0:
+            self.last_error = ((p.stderr or p.stdout or "").strip()[:200]
+                               or "upsc rc=%s" % p.returncode)
+            return False
+        return ("battery.charge" in p.stdout) or ("ups.status" in p.stdout)
+
+    def restart(self, why="", force=False):
+        """重拉 NUT 栈；返回 True = upsc 已恢复读数。两次重拉之间按配置节流。"""
+        with self.lock:
+            now = time.time()
+            gap = max(10, int(self.cfg.get("nut_restart_min_interval", 30)))
+            if not force and now - self.last_restart < gap:
+                return False
+            self.last_restart = now
+            self.restart_count += 1
+            log("nut: 重拉 NUT 栈（%s）第 %d 次" % (why or "自愈", self.restart_count))
+
+            pids = self.driver_pids()
+            if pids:
+                self._kill(pids)
+                time.sleep(1.5)
+                self._kill(self.driver_pids(), signal.SIGKILL)
+            self._reap()
+
+            started = False
+            if shutil.which("upsdrvctl"):
+                started = self._spawn(["upsdrvctl", "start"])
+            if not started:
+                name = self.ups_name() or "wallecube"
+                for binp in ("/lib/nut/usbhid-ups", "/usr/sbin/usbhid-ups", "/sbin/usbhid-ups"):
+                    if os.path.exists(binp):
+                        started = self._spawn([binp, "-a", name])
+                        break
+            time.sleep(1.0)
+
+            if not self.server_pids():
+                for binp in ("/lib/nut/upsd", "/usr/sbin/upsd", "/sbin/upsd"):
+                    if os.path.exists(binp):
+                        self._spawn([binp, "-u", "root"])
+                        break
+                time.sleep(0.5)
+
+            wait = max(3, int(self.cfg.get("nut_restart_wait", 15)))
+            ok = False
+            for _ in range(wait * 2):
+                if self._upsc_ok():
+                    ok = True
+                    break
+                time.sleep(0.5)
+            self._reap()
+            if ok:
+                log("nut: 读数已恢复")
+                self.last_error = ""
+            else:
+                log("nut: 重拉后仍无读数（%s）" % (self.last_error or "unknown"))
+            return ok
 
 
 # ============================================================ 存储
@@ -578,7 +886,7 @@ class Engine:
       2. 市电中断 持续 >= shutdown_delay_min 分钟
       3. 市电中断 且 预计续航 <= shutdown_delay_min 分钟
     倒计时 60 秒（cancel 窗口）后执行：pre_shutdown_commands -> shutdown_command。
-    enable_shutdown=False 或 dry_run=True 时只记录不执行。
+    唯一总开关是 enable_shutdown：为 False 时只记录不执行（dry_run 已废弃，不参与判断）。
     """
 
     def __init__(self, cfg, store):
@@ -594,6 +902,12 @@ class Engine:
         self._stop = False
         self._driver_opts_cache = None   # 驱动选择器面板数据缓存（30s 节流）
         self._driver_opts_t = 0.0
+        self.nut = NutStack(cfg)         # 容器内 NUT 栈看门狗（热插拔自愈）
+        self.devfix_count = 0            # 累计补齐的设备节点数
+        self._lost_since = None          # 读不到数的起始时间（宽限期内不报丢失）
+        self._last_repair = 0.0          # 上次自愈动作时间
+        self._reselect_t = 0.0           # 上次 auto 重选驱动时间
+        self._last_ok_t = time.time()
         self._th = threading.Thread(target=self._loop, daemon=True)
         self._th.start()
 
@@ -601,6 +915,7 @@ class Engine:
     def reload_config(self, cfg):
         with self.state_lock:
             self.cfg = cfg
+            self.nut.cfg = cfg
 
     def rebuild_driver(self):
         """配置改了 driver/driver_preferred，重建驱动实例。轮询循环会自动用新驱动。"""
@@ -632,12 +947,15 @@ class Engine:
         while not self._stop:
             poll = max(3, int(self.cfg.get("poll_sec", 10)))
             try:
+                # 热插拔/重新枚举：节点补齐后旧驱动手里多半是失效句柄 -> 直接重拉
+                if self._poll_devices():
+                    self._after_reenum()
                 r = self.driver.read()
                 if r is None:
-                    if self.last_status not in (None, "driver_lost"):
-                        self.store.add_event("warn", "driver_lost", "UPS 通讯丢失（设备消失或读取失败）")
-                        self.last_status = "driver_lost"
+                    self._on_read_fail()
                 else:
+                    self._lost_since = None
+                    self._last_ok_t = time.time()
                     self._handle(r)
             except Exception as e:
                 log("engine: %r" % e)
@@ -650,8 +968,140 @@ class Engine:
             self._check_pending()
             time.sleep(poll)
 
+    # ---- 热插拔自愈 ----
+    def _poll_devices(self):
+        """按 sysfs 补齐容器内缺失的 USB/hidraw 节点；返回是否真的建出了新节点。"""
+        if not self.cfg.get("devnode_sync", True):
+            return False
+        try:
+            created = self.nut.resync()
+        except Exception as e:
+            log("engine: 设备节点同步异常 %r" % e)
+            return False
+        if not created:
+            return False
+        self.devfix_count += len(created)
+        log("engine: 检测到 UPS 重新枚举，补齐节点 %s" % ", ".join(created))
+        return True
+
+    def _after_reenum(self):
+        """设备重新枚举后重拉 NUT 栈（节流在 NutStack 内部，不会疯狂重启）。"""
+        kind = getattr(self.driver, "kind", "?")
+        mode = (self.cfg.get("driver") or "auto").lower()
+        if kind != "nut" and mode != "auto":
+            return
+        try:
+            if self.nut.restart("USB 重新枚举"):
+                self._reset_driver_cache()
+        except Exception as e:
+            log("engine: 重拉 NUT 栈异常 %r" % e)
+
+    def _reset_driver_cache(self):
+        reset = getattr(self.driver, "reset", None)
+        if callable(reset):
+            try:
+                reset()
+            except Exception:
+                pass
+
+    def _on_read_fail(self):
+        """读不到数：先自愈，宽限期内不报「通讯丢失」，避免热插拔/抖动被当成故障。"""
+        now = time.time()
+        if self._lost_since is None:
+            self._lost_since = now
+            log("engine: 读数失败，开始自愈（%ss 内不报丢失）"
+                % int(self.cfg.get("lost_grace_sec", 120)))
+        gap = max(10, int(self.cfg.get("nut_restart_min_interval", 30)))
+        if now - self._last_repair >= gap:
+            self._last_repair = now
+            if self._repair():
+                r = self._read_now()
+                if r is not None:
+                    self._lost_since = None
+                    self._last_ok_t = time.time()
+                    self._handle(r)
+                    return
+        if self._maybe_reselect():
+            return
+        if now - self._lost_since < int(self.cfg.get("lost_grace_sec", 120)):
+            return
+        if self.last_status not in (None, "driver_lost"):
+            self.store.add_event("warn", "driver_lost",
+                                 "UPS 通讯丢失（设备消失或读取失败，已多次尝试自愈）")
+            self.last_status = "driver_lost"
+
+    def _read_now(self):
+        try:
+            return self.driver.read()
+        except Exception as e:
+            log("engine: 复读失败 %r" % e)
+            return None
+
+    def _repair(self):
+        """补设备节点 + 必要时重拉 NUT 栈。返回是否做了实质动作。"""
+        acted = False
+        try:
+            if self._poll_devices():
+                acted = True
+        except Exception:
+            pass
+        kind = getattr(self.driver, "kind", "?")
+        mode = (self.cfg.get("driver") or "auto").lower()
+        if kind == "nut" or mode == "auto":
+            try:
+                if self.nut.restart("读数失败"):
+                    acted = True
+                    self._reset_driver_cache()
+            except Exception as e:
+                log("engine: NUT 栈重启异常 %r" % e)
+        return acted
+
+    def _maybe_reselect(self):
+        """auto 模式：当前驱动读不到时，看看别的真驱动能不能读（mock 不参与）。"""
+        if (self.cfg.get("driver") or "auto").lower() != "auto":
+            return False
+        now = time.time()
+        if now - self._reselect_t < 60:
+            return False
+        self._reselect_t = now
+        preferred = (self.cfg.get("driver_preferred") or "nut").lower()
+        cands = []
+        for kind, klass in (("nut", NutBridgeDriver), ("hid", HidUpsDriver)):
+            try:
+                d = klass(self.cfg)
+                ok = bool(d.available() and (getattr(d, "can_report", lambda: True)()))
+            except Exception as e:
+                log("engine: 探测 %s 失败 %r" % (kind, e))
+                continue
+            if ok:
+                cands.append((kind, d))
+        if not cands:
+            return False
+        cands.sort(key=lambda x: 0 if x[0] == preferred else 1)
+        kind, drv = cands[0]
+        if getattr(self.driver, "kind", "?") == kind:
+            return False
+        log("engine: auto 切换到可用驱动 %s" % kind)
+        self.store.add_event("info", "driver_switch", "当前驱动读不到数，自动切换到 %s" % kind)
+        self.driver = drv
+        self.last_status = None
+        self._driver_opts_cache = None
+        return True
+
+    def _settling(self):
+        """重连/重拉后的读数不可信期（刚上电常乱报，如 alarm=No battery installed）。"""
+        return (time.time() - self.nut.last_restart) < max(0, int(self.cfg.get("settle_sec", 20)))
+
     def _handle(self, r):
         st = r.get("status")
+        if self._settling():
+            # 只展示、不决策：UPS 刚重新枚举时常报假数据（如"未检测到电池"），
+            # 拿它去触发低电量告警/关机判据会误伤
+            if st in ("online", "on_battery", "detected",
+                      "low_battery", "shutdown_imminent"):
+                self.store.add_reading(r)
+            self.last_reading = r
+            return
         with self.state_lock:
             cfg = dict(self.cfg)
         prev = self.last_status
@@ -810,6 +1260,15 @@ class Engine:
             "driver_preferred": (cfg.get("driver_preferred") or "nut").lower(),
             "driver_options": self._driver_options(),
             "connected": self.last_status not in (None, "driver_lost"),
+            "selfheal": {
+                "stale": self._lost_since is not None,
+                "stale_sec": int(now_ts() - self._lost_since) if self._lost_since else 0,
+                "grace_sec": max(0, int(self.cfg.get("lost_grace_sec", 120))),
+                "settling": self._settling(),
+                "nut_restarts": self.nut.restart_count,
+                "devnodes_fixed": self.devfix_count,
+                "last_error": self.nut.last_error,
+            },
             "status": self.last_status,
             "reading": r,
             "on_battery_since": self.on_battery_since,
@@ -838,7 +1297,7 @@ class Engine:
             if klass is not None:
                 try:
                     d = klass(self.cfg)
-                    avail = bool(d.available())
+                    avail = bool(d.available() and (getattr(d, "can_report", lambda: True)()))
                 except Exception as e:
                     log("driver_options: probe %s failed: %s" % (kind, e))
                     avail = False
@@ -923,7 +1382,11 @@ class Handler(BaseHTTPRequestHandler):
             self._page(render_index())
             return
         if path == "/api/login":
-            self._json({"ok": True, "token": w.token()})
+            # 只用来确认当前会话是否还有效；不给口令就不发 token（老实现等于白送鉴权）
+            if w.authed(self.headers):
+                self._json({"ok": True, "token": w.token()})
+            else:
+                self._json({"ok": False, "error": "unauthorized"}, 401)
             return
         if not w.authed(self.headers):
             self._json({"ok": False, "error": "unauthorized"}, 401)
@@ -1035,6 +1498,14 @@ def main():
         except Exception as e:
             log("config load failed (%s): %s" % (cfg_path, e))
     cfg["data_dir"] = data_dir
+
+    if cfg.get("devnode_sync", True):
+        try:
+            fixed = sync_usb_devnodes()
+            if fixed:
+                log("startup: 补齐 %d 个设备节点: %s" % (len(fixed), ", ".join(fixed)))
+        except Exception as e:
+            log("startup: 设备节点同步失败 %r" % e)
 
     db_path = os.path.join(data_dir, "upsmgr.db")
     store = Store(db_path)
